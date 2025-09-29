@@ -27,19 +27,19 @@ Notes
   it terminates the process.
 """
 
+from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
 import asyncio
 import contextlib
+from datetime import datetime
 import os
-import signal
+from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
-from datetime import datetime
-from pathlib import Path
 from typing import Optional
-
-from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
 
 # =============================
 # CONFIG — EDIT THESE PATHS
@@ -51,12 +51,17 @@ COMFY_HOST = "127.0.0.1"          # Where ComfyUI will listen (keep localhost)
 COMFY_PORT = 8188                  # ComfyUI's port
 
 # Path to ComfyUI repo folder (containing main.py)
-COMFY_DIR = r"D:\ComfyUI"         # ← change to your install path
+COMFY_DIR = r"E:\Servers\ComfyUI"         # ← change to your install path
+
 # Python executable to run ComfyUI (portable builds: point to embedded python)
-PYTHON_EXE = r"C:\Python311\python.exe"  # ← change to your python
+PYTHON_EXE = r"C:\Program Files\Python313\python.exe"  # ← change to your python
+
+# [Alternatively] Conda executable to and env containing Python executable to run ComfyUI
+CONDA_EXE = r"E:\ProgramData\miniforge3\Scripts\conda.exe"  # Path to conda.exe
+ENV_NAME = "comfyui"  # Your env name
 
 # Additional launch args for ComfyUI. Typical: ["--listen", COMFY_HOST, "--port", str(COMFY_PORT)]
-COMFY_ARGS = ["--listen", COMFY_HOST, "--port", str(COMFY_PORT)]
+COMFY_ARGS = ["--listen", "--enable-cors-header", "--highvram", "--input-directory", r"D:\Public\Images\AI_art\ComfyUI\input", "--temp-directory", r"D:\Public\Images\AI_art\ComfyUI\temp", "--output-directory", r"D:\Public\Images\AI_art\ComfyUI\output"]
 
 # Where your ComfyUI user folder lives (for backup); adjust to your install type
 # If unsure, try COMFY_DIR / "user". Desktop builds may use %APPDATA%/ComfyUI/user
@@ -65,7 +70,7 @@ BACKUP_USER_BEFORE_SHUTDOWN = True
 BACKUP_ROOT = Path(COMFY_DIR) / "user_backups"  # backups will be USER_DIR copied under this root
 
 # Idle shutdown
-INACTIVITY_SECS = 30 * 60          # 30 minutes
+INACTIVITY_SECS = 60 * 5          # 30 minutes
 CHECK_PERIOD_SECS = 15             # How often to check for idle
 
 # Internal globals
@@ -123,7 +128,12 @@ async def start_comfy():
         # Create a new process group so we can send CTRL_BREAK later
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
 
-    cmd = [PYTHON_EXE, main_py] + COMFY_ARGS
+    if CONDA_EXE:
+        cmd = [CONDA_EXE, 'run', '-n', ENV_NAME, 'python', main_py] + COMFY_ARGS
+    elif PYTHON_EXE:
+        cmd = [PYTHON_EXE, main_py] + COMFY_ARGS
+    else:
+        cmd = ["python", main_py] + COMFY_ARGS
     _comfy_proc = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -134,6 +144,14 @@ async def start_comfy():
         text=True,
         bufsize=1,
     )
+    print("[ComfyGate] ComfyUI started.")
+    def monitor_proc():
+        _comfy_proc.wait()  # Blocks until process exits
+        if _comfy_proc.returncode != 0:  # Non-zero means error/crash
+            print(f"[ComfyGate] ComfyUI stopped unexpectedly with exit code {_comfy_proc.returncode}")
+        else:
+            print("[ComfyGate] ComfyUI stopped normally")
+    threading.Thread(target=monitor_proc, daemon=True).start()
 
 
 async def stop_comfy():
@@ -166,6 +184,7 @@ async def stop_comfy():
                 _comfy_proc.kill()
     finally:
         _comfy_proc = None
+        print("[ComfyGate] ComfyUI stopped.")
 
 
 async def idle_watchdog(app: web.Application):
@@ -177,6 +196,8 @@ async def idle_watchdog(app: web.Application):
             if idle_for >= INACTIVITY_SECS and _active_ws == 0 and comfy_running():
                 print(f"[ComfyGate] Idle for {int(idle_for)}s → stopping ComfyUI…")
                 await stop_comfy()
+            else:
+                print(f"[ComfyGate] Idle for {int(idle_for)}s, _active_ws={int(_active_ws)}, comfy_running={comfy_running}")
     finally:
         await app.shutdown()
 
@@ -331,13 +352,12 @@ def make_app() -> web.Application:
     app = web.Application()
     app.add_routes([
         web.get("/__comfygate/health", handle_health),
-        web.route("GET", "/{tail:.*}", proxy_http),
-        web.route("POST", "/{tail:.*}", proxy_http),
-        web.route("PUT", "/{tail:.*}", proxy_http),
-        web.route("PATCH", "/{tail:.*}", proxy_http),
-        web.route("DELETE", "/{tail:.*}", proxy_http),
-        web.route("HEAD", "/{tail:.*}", proxy_http),
-        web.route("OPTIONS", "/{tail:.*}", proxy_http),
+        web.get("/{tail:.*}", proxy_http),       # Handles both GET and HEAD
+        web.post("/{tail:.*}", proxy_http),
+        web.put("/{tail:.*}", proxy_http),
+        web.patch("/{tail:.*}", proxy_http),
+        web.delete("/{tail:.*}", proxy_http),
+        web.options("/{tail:.*}", proxy_http),
     ])
     return app
 
@@ -361,3 +381,12 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
+r"""
+todo:
+- connection still produces harmless errors
+- websockets never timeout and close
+- we'd like a short timeout time if there are no open websockets, and a long timeout time if there are
+- we want ComfyUI to reliably close if ComfyGate crashes or is forcibly stopped
+- everything machine specific through ini
+"""
