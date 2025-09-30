@@ -6,8 +6,9 @@ What it does
 • Listens on http://127.0.0.1:9000 (configurable) as a tiny gate in front of ComfyUI.
 • If a request arrives and ComfyUI is NOT running, it starts ComfyUI and shows a waiting page.
 • Once ComfyUI responds, it transparently reverse‑proxies all HTTP and WebSocket traffic to it.
-• Tracks activity; if there are no requests or WebSocket traffic for INACTIVITY_SECS (default 1800s),
-  it (optionally) backs up your ComfyUI user folder and then gracefully stops ComfyUI.
+• Tracks activity; if there are no requests or WebSocket traffic for INACTIVITY_TIMEOUT_COMFYUI 
+  (default 1800s), it (optionally) backs up your ComfyUI user folder and then gracefully stops 
+  ComfyUI.
 
 How to use (quick)
 ==================
@@ -69,9 +70,13 @@ USER_DIR = Path(COMFY_DIR) / "user"
 BACKUP_USER_BEFORE_SHUTDOWN = True
 BACKUP_ROOT = Path(COMFY_DIR) / "user_backups"  # backups will be USER_DIR copied under this root
 
+VERBOSE = True
+
 # Idle shutdown
-INACTIVITY_SECS = 60 * 5          # 30 minutes
-CHECK_PERIOD_SECS = 15             # How often to check for idle
+INACTIVITY_TIMEOUT_WS = 60 * 60        # (seconds) when to turn off the websocket (restarts immediately if page open)
+INACTIVITY_TIMEOUT_COMFYUI = 60 * 5   # (seconds) when to shutdown the backend server if no websockets
+INACTIVITY_TIMEOUT_HARD = 60 * 720     # (seconds) when to hard shutdown the backend server even if there are open websockets
+CHECK_PERIOD_SECS = 30                # How often to check for idle
 
 # Internal globals
 _comfy_proc: Optional[subprocess.Popen] = None
@@ -79,7 +84,8 @@ _starting_lock = asyncio.Lock()
 _last_activity = time.monotonic()
 _active_ws = 0
 
-FORWARDED_HEADERS = {
+header_forwarding_policy = 'whitelist'  # 'blacklist' or 'whitelist'
+WHITELISTED_HEADERS = {
     # headers we forward from Abyss/browser to ComfyUI; Host is overridden to upstream host
     "User-Agent",
     "Accept",
@@ -95,6 +101,7 @@ FORWARDED_HEADERS = {
     "Sec-WebSocket-Version",
     "Sec-WebSocket-Extensions",
 }
+BLACKLISTED_HEADERS = {"Host", "Connection", "Upgrade", "Proxy-Authorization", "X-Forwarded-For"}
 
 
 def activity_tick():
@@ -138,19 +145,20 @@ async def start_comfy():
         cmd,
         cwd=cwd,
         stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
         creationflags=creationflags,
         text=True,
         bufsize=1,
     )
     print("[ComfyGate] ComfyUI started.")
+    
     def monitor_proc():
         _comfy_proc.wait()  # Blocks until process exits
-        if _comfy_proc.returncode != 0:  # Non-zero means error/crash
-            print(f"[ComfyGate] ComfyUI stopped unexpectedly with exit code {_comfy_proc.returncode}")
-        else:
+        if _comfy_proc.returncode in [0, -1073741510, 3221225786]:  # 0=normal, others=Ctrl+Break interrupt
             print("[ComfyGate] ComfyUI stopped normally")
+        else:
+            print(f"[ComfyGate] ComfyUI stopped unexpectedly with exit code {_comfy_proc.returncode}")
     threading.Thread(target=monitor_proc, daemon=True).start()
 
 
@@ -193,11 +201,12 @@ async def idle_watchdog(app: web.Application):
         while True:
             await asyncio.sleep(CHECK_PERIOD_SECS)
             idle_for = time.monotonic() - _last_activity
-            if idle_for >= INACTIVITY_SECS and _active_ws == 0 and comfy_running():
+            if idle_for >= INACTIVITY_TIMEOUT_COMFYUI and _active_ws == 0 and comfy_running():
                 print(f"[ComfyGate] Idle for {int(idle_for)}s → stopping ComfyUI…")
                 await stop_comfy()
-            else:
-                print(f"[ComfyGate] Idle for {int(idle_for)}s, _active_ws={int(_active_ws)}, comfy_running={comfy_running}")
+            elif idle_for >= INACTIVITY_TIMEOUT_HARD and comfy_running():
+                print(f"[ComfyGate] Idle for {int(idle_for)}s, [Warning]{int(_active_ws)} active websockets → stopping ComfyUI…")
+                await stop_comfy()
     finally:
         await app.shutdown()
 
@@ -253,24 +262,33 @@ async def ensure_comfy_started():
 
 async def proxy_ws(request: web.Request):
     global _active_ws
-    activity_tick()
+    activity_tick()                         # global _last_activity: for all websockets, http, and handle_health
+    local_last_activity = time.monotonic()  # for just this websocket
+    timed_out = False
+    
     # Ensure upstream exists (start if needed)
     await ensure_comfy_started()
 
     ws_server = web.WebSocketResponse()
     await ws_server.prepare(request)
+    _active_ws += 1
+    print(f"[ComfyGate] Opened new WebSocket")
 
     upstream_url = f"http://{COMFY_HOST}:{COMFY_PORT}{request.rel_url}"
-    headers = {k: v for k, v in request.headers.items() if k in FORWARDED_HEADERS}
+    if header_forwarding_policy == 'whitelist':
+        headers = {k: v for k, v in request.headers.items() if k in WHITELISTED_HEADERS}
+    else:
+        headers = {k: v for k, v in request.headers.items() if k not in BLACKLISTED_HEADERS}
     headers["Host"] = f"{COMFY_HOST}:{COMFY_PORT}"
 
-    _active_ws += 1
     try:
         async with ClientSession() as session:
             async with session.ws_connect(upstream_url, headers=headers) as ws_client:
                 async def ws_to_upstream():
+                    nonlocal local_last_activity
                     async for msg in ws_server:
                         activity_tick()
+                        local_last_activity = time.monotonic()
                         if msg.type == WSMsgType.TEXT:
                             await ws_client.send_str(msg.data)
                         elif msg.type == WSMsgType.BINARY:
@@ -282,11 +300,16 @@ async def proxy_ws(request: web.Request):
                         elif msg.type == WSMsgType.CLOSE:
                             await ws_client.close()
                         elif msg.type == WSMsgType.ERROR:
+                            print(f"[ComfyGate] client sent message type ERROR")
                             break
+                        else:
+                            print(f"[ComfyGate] client sent unhandled message type {msg.type}")
 
                 async def upstream_to_ws():
+                    nonlocal local_last_activity
                     async for msg in ws_client:
                         activity_tick()
+                        local_last_activity = time.monotonic()
                         if msg.type == WSMsgType.TEXT:
                             await ws_server.send_str(msg.data)
                         elif msg.type == WSMsgType.BINARY:
@@ -295,13 +318,32 @@ async def proxy_ws(request: web.Request):
                             await ws_server.ping()
                         elif msg.type == WSMsgType.PONG:
                             continue
-                        elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
+                        elif msg.type == WSMsgType.CLOSE:
                             break
+                        elif msg.type == WSMsgType.ERROR:
+                            print(f"[ComfyGate] server returned message type ERROR")
+                            break
+                        else:
+                            print(f"[ComfyGate] server returned unhandled message type {msg.type}")
+                            
+                async def ws_timeout_monitor():
+                    nonlocal local_last_activity, timed_out
+                    while True:
+                        await asyncio.sleep(CHECK_PERIOD_SECS)
+                        idle_for = time.monotonic() - local_last_activity
+                        if idle_for >= INACTIVITY_TIMEOUT_WS:
+                            print(f"[ComfyGate] Closing inactive WebSocket after {int(idle_for)}s")
+                            timed_out = True
+                            await ws_client.close()  # Close upstream first
+                            await ws_server.close()  # Then client-side
+                            break  # Exit monitor task
 
-                await asyncio.gather(ws_to_upstream(), upstream_to_ws())
+                await asyncio.gather(ws_to_upstream(), upstream_to_ws(), ws_timeout_monitor())
     finally:
-        _active_ws -= 1
+        if not timed_out:
+            print(f"[ComfyGate] WebSocket Closed")
         await ws_server.close()
+        _active_ws -= 1
         return ws_server
 
 
@@ -321,7 +363,7 @@ async def proxy_http(request: web.Request):
 
     # Proxy HTTP request
     upstream_url = f"http://{COMFY_HOST}:{COMFY_PORT}{request.rel_url}"
-    headers = {k: v for k, v in request.headers.items() if k in FORWARDED_HEADERS}
+    headers = {k: v for k, v in request.headers.items() if k in WHITELISTED_HEADERS}
     headers["Host"] = f"{COMFY_HOST}:{COMFY_PORT}"
 
     data = await request.read()
@@ -385,8 +427,7 @@ if __name__ == "__main__":
 r"""
 todo:
 - connection still produces harmless errors
-- websockets never timeout and close
-- we'd like a short timeout time if there are no open websockets, and a long timeout time if there are
 - we want ComfyUI to reliably close if ComfyGate crashes or is forcibly stopped
 - everything machine specific through ini
+- refuse launch launch.bat if another instance is already running
 """
