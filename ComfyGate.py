@@ -334,7 +334,7 @@ async def proxy_ws(request: web.Request):
 
     try:
         async with ClientSession() as session:
-            async with session.ws_connect(upstream_url, headers=headers, compress=0, autoping=True, autoclose=True, timeout=None) as ws_client:
+            async with session.ws_connect(upstream_url, headers=headers, compress=0, autoping=True, autoclose=True, timeout=10) as ws_client:
                 async def ws_to_upstream():
                     nonlocal local_last_activity
                     async for msg in ws_server:
