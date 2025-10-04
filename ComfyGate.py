@@ -514,6 +514,7 @@ if __name__ == "__main__":
 r"""
 todo:
 - give error screen if another instance of ComfyUI or any VRAM using app is already running
+- can't read/write properly from /api/userdata, path not being translated? check ComfyUI source
 - everything machine specific through ini
 - we want ComfyUI to reliably close if ComfyGate crashes
 - connection still produces harmless errors
