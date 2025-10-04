@@ -41,6 +41,8 @@ import sys
 import threading
 import time
 from typing import Optional
+from urllib.parse import unquote
+import yarl
 
 # =============================
 # CONFIG — EDIT THESE PATHS
@@ -55,26 +57,27 @@ COMFY_PORT = 8188                  # ComfyUI's port
 COMFY_DIR = r"E:\Servers\ComfyUI"         # ← change to your install path
 
 # Python executable to run ComfyUI (portable builds: point to embedded python)
-PYTHON_EXE = r"C:\Program Files\Python313\python.exe"  # ← change to your python
-
-# [Alternatively] Conda executable to and env containing Python executable to run ComfyUI
-CONDA_EXE = r"E:\ProgramData\miniforge3\Scripts\conda.exe"  # Path to conda.exe
-ENV_NAME = "comfyui"  # Your env name
+PYTHON_EXE = r"E:\ProgramData\miniforge3\envs\comfyui\python.exe"  # ← change to your python
 
 # Additional launch args for ComfyUI. Typical: ["--listen", COMFY_HOST, "--port", str(COMFY_PORT)]
-COMFY_ARGS = ["--listen", "--enable-cors-header", "--highvram", "--input-directory", r"D:\Public\Images\AI_art\ComfyUI\input", "--temp-directory", r"D:\Public\Images\AI_art\ComfyUI\temp", "--output-directory", r"D:\Public\Images\AI_art\ComfyUI\output"]
+COMFY_ARGS = ["--listen", "--port", str(COMFY_PORT), "--enable-cors-header", "--highvram", "--input-directory", r"D:\Public\Images\AI_art\ComfyUI\input", "--temp-directory", r"D:\Public\Images\AI_art\ComfyUI\temp", "--output-directory", r"D:\Public\Images\AI_art\ComfyUI\output"]
 
 # Where your ComfyUI user folder lives (for backup); adjust to your install type
 # If unsure, try COMFY_DIR / "user". Desktop builds may use %APPDATA%/ComfyUI/user
 USER_DIR = Path(COMFY_DIR) / "user"
-BACKUP_USER_BEFORE_SHUTDOWN = True
+BACKUP_USER_BEFORE_SHUTDOWN = False
 BACKUP_ROOT = Path(COMFY_DIR) / "user_backups"  # backups will be USER_DIR copied under this root
 
 VERBOSE = True
+WS_TIMEOUT = True  #  Web sockets can time out
+ASYNCIO_TWEAKS = False  # [experimental] non-critical asyncio-related code (WindowsSelectorEventLoopPolicy)
+FIX_URLS_IN_LOCATION_RESPONSE_HEADERS = False  # [experimental] Rewrite location-related headers to proxy URL
+DECODE_PATHS = False  # [experimental] decode % encoded characters in paths(not helping)
+USE_EXTERNAL_COMFYUI = False  # [experimental] rely on a manually launched instance of ComfyUI
 
 # Idle shutdown
-INACTIVITY_TIMEOUT_WS = 60 * 60        # (seconds) when to turn off the websocket (restarts immediately if page open)
-INACTIVITY_TIMEOUT_COMFYUI = 60 * 5   # (seconds) when to shutdown the backend server if no websockets
+INACTIVITY_TIMEOUT_WS = 60 * 5        # (seconds) when to turn off the websocket (restarts immediately if page open)
+INACTIVITY_TIMEOUT_COMFYUI = 60 * 2   # (seconds) when to shutdown the backend server if no websockets
 INACTIVITY_TIMEOUT_HARD = 60 * 720     # (seconds) when to hard shutdown the backend server even if there are open websockets
 CHECK_PERIOD_SECS = 30                # How often to check for idle
 
@@ -97,9 +100,8 @@ WHITELISTED_HEADERS = {
     "Referer",
     "Cookie",
     "X-Requested-With",
-    "Sec-WebSocket-Key",
-    "Sec-WebSocket-Version",
-    "Sec-WebSocket-Extensions",
+    "Host",  # Added to preserve/forward the original Host header (e.g., from Abyss) to ComfyUI
+    "X-Forwarded-Proto",  # Added to forward the X-Forwarded-Proto header (e.g., 'https' from Abyss) to ComfyUI
 }
 BLACKLISTED_HEADERS = {"Host", "Connection", "Upgrade", "Proxy-Authorization", "X-Forwarded-For"}
 
@@ -110,6 +112,8 @@ def activity_tick():
 
 
 def comfy_running() -> bool:
+    if USE_EXTERNAL_COMFYUI:
+        return True
     return _comfy_proc is not None and _comfy_proc.poll() is None
 
 
@@ -128,19 +132,28 @@ async def start_comfy():
 
     # Ensure working directory
     cwd = str(Path(COMFY_DIR))
-    main_py = str(Path(COMFY_DIR) / "main.py")
+    
+    if ASYNCIO_TWEAKS:
+        policy_line = "import asyncio, runpy, sys, os; asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy()); "
+    else:
+        policy_line = "import asyncio, runpy, sys, os; "
+    
+    bootstrap = (
+        policy_line +
+        f"path={repr(str(Path(COMFY_DIR) / 'main.py'))}; "
+        "sys.path.insert(0, os.path.dirname(path)); "
+        "runpy.run_path(path, run_name='__main__')"
+    )
 
     creationflags = 0
     if os.name == "nt":
         # Create a new process group so we can send CTRL_BREAK later
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
 
-    if CONDA_EXE:
-        cmd = [CONDA_EXE, 'run', '-n', ENV_NAME, 'python', main_py] + COMFY_ARGS
-    elif PYTHON_EXE:
-        cmd = [PYTHON_EXE, main_py] + COMFY_ARGS
+    if PYTHON_EXE:
+        cmd = [PYTHON_EXE, '-c', bootstrap] + COMFY_ARGS
     else:
-        cmd = ["python", main_py] + COMFY_ARGS
+        cmd = ["python", '-c', bootstrap] + COMFY_ARGS
     _comfy_proc = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -154,17 +167,20 @@ async def start_comfy():
     print("[ComfyGate] ComfyUI started.")
     
     def monitor_proc():
-        _comfy_proc.wait()  # Blocks until process exits
-        if _comfy_proc.returncode in [0, -1073741510, 3221225786]:  # 0=normal, others=Ctrl+Break interrupt
+        proc = _comfy_proc  # capture to avoid races if global is cleared
+        if proc is None:
+            return
+        proc.wait()
+        if proc.returncode in [0, -1073741510, 3221225786]:
             print("[ComfyGate] ComfyUI stopped normally")
         else:
-            print(f"[ComfyGate] ComfyUI stopped unexpectedly with exit code {_comfy_proc.returncode}")
+            print(f"[ComfyGate] ComfyUI stopped unexpectedly with exit code {proc.returncode}")
     threading.Thread(target=monitor_proc, daemon=True).start()
 
 
 async def stop_comfy():
     global _comfy_proc
-    if not comfy_running():
+    if not comfy_running() or USE_EXTERNAL_COMFYUI:
         return
 
     # Optional backup
@@ -178,38 +194,58 @@ async def stop_comfy():
         except Exception as e:
             print(f"[ComfyGate] Backup failed: {e}")
 
-    # Try graceful stop via CTRL_BREAK on Windows; fall back to terminate
+    # Try graceful stop via Ctrl-C
     try:
-        if os.name == "nt":
-            os.kill(_comfy_proc.pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
-            await asyncio.sleep(3)
-        # If still alive, terminate
-        if _comfy_proc.poll() is None:
-            _comfy_proc.terminate()
+        os.kill(_comfy_proc.pid, signal.CTRL_C_EVENT)
+        await asyncio.sleep(10)
+    except Exception as e:  # Catch any signal send failures (e.g., permission, invalid signal)
+        print(f"[ComfyGate] WARNING: Graceful signal(Ctrl-C) failed to shutdown ComfyUI: {e}")
+
+    # If still alive, SIGINT
+    if _comfy_proc.poll() is None:
+        try:
+            print("[ComfyGate] WARNING: Graceful shutdown timed out, attempting SIGINT")
+            os.kill(_comfy_proc.pid, signal.SIGINT)
+            await asyncio.sleep(10)
+        except Exception as e:  # Catch any signal send failures (e.g., permission, invalid signal)
+            print(f"[ComfyGate] WARNING: SIGINT failed to shutdown ComfyUI: {e}")
+
+    # If still alive, Ctrl-Break
+    if _comfy_proc.poll() is None:
+        try:
+            print("[ComfyGate] WARNING: Graceful shutdown timed out, attempting Ctrl-Break")
+            os.kill(_comfy_proc.pid, signal.CTRL_BREAK_EVENT)
+            await asyncio.sleep(10)
+        except Exception as e:  # Catch any signal send failures (e.g., permission, invalid signal)
+            print(f"[ComfyGate] WARNING: Ctrl-Break failed to shutdown ComfyUI: {e}")
+
+    # If still alive, terminate / kill
+    if _comfy_proc.poll() is None:
+        print("[ComfyGate] WARNING: Ctrl-Break timed out, attempting terminate")
+        _comfy_proc.terminate()
+        try:
+            _comfy_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            print("[ComfyGate] WARNING: terminate failed to shutdown ComfyUI")
+            _comfy_proc.kill()
             try:
                 _comfy_proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                _comfy_proc.kill()
-    finally:
-        _comfy_proc = None
-        print("[ComfyGate] ComfyUI stopped.")
+                print("[ComfyGate] ERROR: kill failed to shutdown ComfyUI")
+    # Always clear out at the end
+    _comfy_proc = None
 
 
-async def idle_watchdog(app: web.Application):
-    await app.startup()
-    try:
-        while True:
-            await asyncio.sleep(CHECK_PERIOD_SECS)
-            idle_for = time.monotonic() - _last_activity
-            if idle_for >= INACTIVITY_TIMEOUT_COMFYUI and _active_ws == 0 and comfy_running():
-                print(f"[ComfyGate] Idle for {int(idle_for)}s → stopping ComfyUI…")
-                await stop_comfy()
-            elif idle_for >= INACTIVITY_TIMEOUT_HARD and comfy_running():
-                print(f"[ComfyGate] Idle for {int(idle_for)}s, [Warning]{int(_active_ws)} active websockets → stopping ComfyUI…")
-                await stop_comfy()
-    finally:
-        await app.shutdown()
-
+async def idle_watchdog():
+    while True:
+        await asyncio.sleep(CHECK_PERIOD_SECS)
+        idle_for = time.monotonic() - _last_activity
+        if idle_for >= INACTIVITY_TIMEOUT_COMFYUI and _active_ws == 0 and comfy_running():
+            print(f"[ComfyGate] Idle for {int(idle_for)}s → stopping ComfyUI…")
+            await stop_comfy()
+        elif idle_for >= INACTIVITY_TIMEOUT_HARD and comfy_running():
+            print(f"[ComfyGate] Idle for {int(idle_for)}s, [Warning]{int(_active_ws)} active websockets → stopping ComfyUI…")
+            await stop_comfy()
 
 WAIT_PAGE = f"""
 <!doctype html>
@@ -269,21 +305,36 @@ async def proxy_ws(request: web.Request):
     # Ensure upstream exists (start if needed)
     await ensure_comfy_started()
 
-    ws_server = web.WebSocketResponse()
+    ws_server = web.WebSocketResponse(compress=0)
     await ws_server.prepare(request)
     _active_ws += 1
     print(f"[ComfyGate] Opened new WebSocket")
 
-    upstream_url = f"http://{COMFY_HOST}:{COMFY_PORT}{request.rel_url}"
-    if header_forwarding_policy == 'whitelist':
-        headers = {k: v for k, v in request.headers.items() if k in WHITELISTED_HEADERS}
+    if DECODE_PATHS and request.method == 'GET' and str(request.rel_url).startswith('/api/userdata'):
+        decoded_path = unquote(request.rel_url.path)
+        upstream_url = f"http://{COMFY_HOST}:{COMFY_PORT}{decoded_path}"
+        if request.rel_url.query_string:
+            upstream_url += '?' + request.rel_url.query_string
+        if VERBOSE:
+            print(f"[ComfyGate](ws) Original upstream: http://{COMFY_HOST}:{COMFY_PORT}{request.rel_url}")
+            print(f"[ComfyGate](ws) Decoded upstream: {upstream_url}")
     else:
-        headers = {k: v for k, v in request.headers.items() if k not in BLACKLISTED_HEADERS}
+        upstream_url = f"http://{COMFY_HOST}:{COMFY_PORT}{request.rel_url}"
+    
+    # Minimal, safe headers; let aiohttp generate Sec-WebSocket-* itself.
+    headers = {}
+    for k in ("User-Agent", "Origin", "Cookie"):
+        v = request.headers.get(k)
+        if v:
+            headers[k] = v
+    sp = request.headers.get("Sec-WebSocket-Protocol")
+    if sp:
+        headers["Sec-WebSocket-Protocol"] = sp
     headers["Host"] = f"{COMFY_HOST}:{COMFY_PORT}"
 
     try:
         async with ClientSession() as session:
-            async with session.ws_connect(upstream_url, headers=headers) as ws_client:
+            async with session.ws_connect(upstream_url, headers=headers, compress=0, autoping=True, autoclose=True, timeout=None) as ws_client:
                 async def ws_to_upstream():
                     nonlocal local_last_activity
                     async for msg in ws_server:
@@ -293,10 +344,8 @@ async def proxy_ws(request: web.Request):
                             await ws_client.send_str(msg.data)
                         elif msg.type == WSMsgType.BINARY:
                             await ws_client.send_bytes(msg.data)
-                        elif msg.type == WSMsgType.PING:
-                            await ws_client.ping()
-                        elif msg.type == WSMsgType.PONG:
-                            continue
+                        elif msg.type in (WSMsgType.PING, WSMsgType.PONG):
+                            continue  # autoping handles it
                         elif msg.type == WSMsgType.CLOSE:
                             await ws_client.close()
                         elif msg.type == WSMsgType.ERROR:
@@ -314,10 +363,8 @@ async def proxy_ws(request: web.Request):
                             await ws_server.send_str(msg.data)
                         elif msg.type == WSMsgType.BINARY:
                             await ws_server.send_bytes(msg.data)
-                        elif msg.type == WSMsgType.PING:
-                            await ws_server.ping()
-                        elif msg.type == WSMsgType.PONG:
-                            continue
+                        elif msg.type in (WSMsgType.PING, WSMsgType.PONG):
+                            continue  # autoping handles it
                         elif msg.type == WSMsgType.CLOSE:
                             break
                         elif msg.type == WSMsgType.ERROR:
@@ -334,15 +381,26 @@ async def proxy_ws(request: web.Request):
                         if idle_for >= INACTIVITY_TIMEOUT_WS:
                             print(f"[ComfyGate] Closing inactive WebSocket after {int(idle_for)}s")
                             timed_out = True
-                            await ws_client.close()  # Close upstream first
-                            await ws_server.close()  # Then client-side
+                            with contextlib.suppress(Exception):  # Close upstream first
+                                await ws_client.close(code=1000, message=b"idle timeout")
+                                await ws_client.wait_closed()
+                            await asyncio.sleep(0.2)
+                            with contextlib.suppress(Exception):  # Then client-side
+                                await ws_server.close(code=1000, message=b"idle timeout")
                             break  # Exit monitor task
 
-                await asyncio.gather(ws_to_upstream(), upstream_to_ws(), ws_timeout_monitor())
+                try:
+                    if WS_TIMEOUT:
+                        await asyncio.gather(ws_to_upstream(), upstream_to_ws(), ws_timeout_monitor())
+                    else:
+                        await asyncio.gather(ws_to_upstream(), upstream_to_ws())
+                except (ConnectionResetError, asyncio.CancelledError):
+                    pass
     finally:
         if not timed_out:
             print(f"[ComfyGate] WebSocket Closed")
-        await ws_server.close()
+        with contextlib.suppress(Exception):
+            await ws_server.close()
         _active_ws -= 1
         return ws_server
 
@@ -353,16 +411,29 @@ async def proxy_http(request: web.Request):
     if request.headers.get("Upgrade", "").lower() == "websocket":
         return await proxy_ws(request)
 
+    
+
     # Ensure upstream exists (start if needed); if not ready yet, show waiting page
     async with ClientSession() as session:
         if not await comfy_ready(session):
             await ensure_comfy_started()
-            return web.Response(text=WAIT_PAGE, content_type="text/html", headers={
-                "Cache-Control": "no-store"
-            })
+            return web.Response(
+                text=WAIT_PAGE,
+                content_type="text/html",
+                headers={"Cache-Control": "no-store", "Connection": "close"},
+            )
 
     # Proxy HTTP request
-    upstream_url = f"http://{COMFY_HOST}:{COMFY_PORT}{request.rel_url}"
+    if DECODE_PATHS and request.method == 'GET' and str(request.rel_url).startswith('/api/userdata'):
+        decoded_path = unquote(request.rel_url.path)
+        upstream_url = f"http://{COMFY_HOST}:{COMFY_PORT}{decoded_path}"
+        if request.rel_url.query_string:
+            upstream_url += '?' + request.rel_url.query_string
+        if VERBOSE:
+            print(f"[ComfyGate] Original upstream: http://{COMFY_HOST}:{COMFY_PORT}{request.rel_url}")
+            print(f"[ComfyGate] Decoded upstream: {upstream_url}")
+    else:
+        upstream_url = f"http://{COMFY_HOST}:{COMFY_PORT}{request.rel_url}"
     headers = {k: v for k, v in request.headers.items() if k in WHITELISTED_HEADERS}
     headers["Host"] = f"{COMFY_HOST}:{COMFY_PORT}"
 
@@ -376,6 +447,16 @@ async def proxy_http(request: web.Request):
             data=data if data else None,
             allow_redirects=False,
         ) as resp:
+            if FIX_URLS_IN_LOCATION_RESPONSE_HEADERS:
+                # Rewrite location-related headers to proxy URL
+                proxy_base = f"{request.scheme}://{request.host}"
+                comfy_base = f"http://{COMFY_HOST}:{COMFY_PORT}"
+                for header in ['Location', 'Content-Location', 'URI']:
+                    if header in resp.headers:
+                        url = resp.headers[header]
+                        if url.startswith(comfy_base):
+                            url = url.replace(comfy_base, proxy_base, 1)
+                        resp.headers[header] = url  # Update before forwarding
             # Stream response back
             raw = web.StreamResponse(status=resp.status, reason=resp.reason)
             for (k, v) in resp.headers.items():
@@ -410,12 +491,18 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, LISTEN_HOST, LISTEN_PORT)
     print(f"[ComfyGate] Listening on http://{LISTEN_HOST}:{LISTEN_PORT}")
-    asyncio.create_task(idle_watchdog(app))
+    asyncio.create_task(idle_watchdog())
     await site.start()
 
-    # Keep running
-    while True:
-        await asyncio.sleep(3600)
+    # Keep running until interrupted
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        print("[ComfyGate] Shutting down...")
+        await app.shutdown()  # Runs on_shutdown handlers
+        await stop_comfy()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
@@ -426,8 +513,8 @@ if __name__ == "__main__":
 
 r"""
 todo:
-- connection still produces harmless errors
-- we want ComfyUI to reliably close if ComfyGate crashes or is forcibly stopped
+- give error screen if another instance of ComfyUI or any VRAM using app is already running
 - everything machine specific through ini
-- refuse launch launch.bat if another instance is already running
+- we want ComfyUI to reliably close if ComfyGate crashes
+- connection still produces harmless errors
 """
