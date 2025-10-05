@@ -117,6 +117,26 @@ def comfy_running() -> bool:
     return _comfy_proc is not None and _comfy_proc.poll() is None
 
 
+def is_blocked() -> bool:
+    """
+    Check if a blocking program (e.g., another VRAM-using app) is running.
+    Here, we use nvidia-smi to check for any compute processes on the GPU.
+    Adjust this function if you have a different way to detect the specific program.
+    """
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"],
+            text=True,
+            stderr=subprocess.DEVNULL
+        )
+        lines = output.strip().split('\n')
+        # If there are any lines (processes using GPU for compute), consider blocked
+        return bool(lines and any(line.strip() for line in lines))
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # If nvidia-smi not found or fails, assume not blocked (or handle differently)
+        return False
+
+
 async def comfy_ready(session: ClientSession) -> bool:
     try:
         async with session.get(f"http://{COMFY_HOST}:{COMFY_PORT}/", timeout=ClientTimeout(total=2)) as resp:
@@ -255,8 +275,20 @@ WAIT_PAGE = f"""
 <style>
   body {{ font-family: system-ui, sans-serif; display:grid; place-items:center; height:100dvh; margin:0; }}
   .box {{ text-align:center; max-width: 42rem; padding: 2rem; }}
-  .dots::after {{ content: '…'; animation: dots 1.5s steps(3, end) infinite; }}
-  @keyframes dots {{ 0% {{ content:''; }} 33% {{ content:'.'; }} 66% {{ content:'..'; }} 100% {{ content:'...'; }} }}
+  .dots::after {{ content: '..........'; animation: dots 25s steps(10, end); }}
+  @keyframes dots {{
+    0% {{ content: ''; }}
+    10% {{ content: '.'; }}
+    20% {{ content: '..'; }}
+    30% {{ content: '...'; }}
+    40% {{ content: '....'; }}
+    50% {{ content: '.....'; }}
+    60% {{ content: '......'; }}
+    70% {{ content: '.......'; }}
+    80% {{ content: '........'; }}
+    90% {{ content: '.........'; }}
+    100% {{ content: '..........'; }}
+  }}
 </style>
 <div class="box">
   <h1>Warming up ComfyUI<span class="dots"></span></h1>
@@ -275,7 +307,54 @@ WAIT_PAGE = f"""
        }}
      }}
    }} catch (e) {{}}
-   setTimeout(poll, 1000);
+   setTimeout(poll, 3000);
+ }}
+ poll();
+</script>
+"""
+
+REFUSAL_PAGE = f"""
+<!doctype html>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ComfyUI Blocked</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; display:grid; place-items:center; height:100dvh; margin:0; }}
+  .box {{ text-align:center; max-width: 42rem; padding: 2rem; }}
+  .dots::after {{ content: '..........'; animation: dots 30s steps(10, end) infinite; }}
+  @keyframes dots {{
+    0% {{ content: ''; }}
+    10% {{ content: '.'; }}
+    20% {{ content: '..'; }}
+    30% {{ content: '...'; }}
+    40% {{ content: '....'; }}
+    50% {{ content: '.....'; }}
+    60% {{ content: '......'; }}
+    70% {{ content: '.......'; }}
+    80% {{ content: '........'; }}
+    90% {{ content: '.........'; }}
+    100% {{ content: '..........'; }}
+  }}
+</style>
+<div class="box">
+  <h1>ComfyUI is blocked<span class="dots"></span></h1>
+  <p>Another program is using resources (e.g., GPU). Please close any other AI applications or ComfyUI instances.</p>
+  <p>Checking again in 30 seconds. You’ll be redirected automatically when available.</p>
+  <p><small>If this persists, check the service logs or task manager.</small></p>
+</div>
+<script>
+ async function poll() {{
+   try {{
+     const r = await fetch('/__comfygate/health', {{cache: 'no-store'}});
+     if (r.ok) {{
+       const j = await r.json();
+       if (j.status !== 'blocked') {{
+         window.location.reload();
+         return;
+       }}
+     }}
+   }} catch (e) {{}}
+   setTimeout(poll, 30000);
  }}
  poll();
 </script>
@@ -286,7 +365,15 @@ async def handle_health(request: web.Request):
     activity_tick()
     async with ClientSession() as session:
         ready = await comfy_ready(session)
-        return web.json_response({"status": "ready" if ready else "starting"})
+        if ready:
+            status = "ready"
+        elif comfy_running():
+            status = "starting"
+        elif is_blocked():
+            status = "blocked"
+        else:
+            status = "idle"
+        return web.json_response({"status": status})
 
 
 async def ensure_comfy_started():
@@ -411,19 +498,46 @@ async def proxy_http(request: web.Request):
     if request.headers.get("Upgrade", "").lower() == "websocket":
         return await proxy_ws(request)
 
-    
-
-    # Ensure upstream exists (start if needed); if not ready yet, show waiting page
     async with ClientSession() as session:
-        if not await comfy_ready(session):
-            await ensure_comfy_started()
-            return web.Response(
-                text=WAIT_PAGE,
-                content_type="text/html",
-                headers={"Cache-Control": "no-store", "Connection": "close"},
-            )
+        ready = await comfy_ready(session)
+        if ready:
+            if comfy_running():
+                # Proxy normally if our instance is running
+                pass
+            else:
+                # Another instance (not launched by us) is responding on the port → refusal
+                return web.Response(
+                    text=REFUSAL_PAGE,
+                    content_type="text/html",
+                    headers={"Cache-Control": "no-store", "Connection": "close"},
+                )
+        else:
+            if comfy_running():
+                # Our instance is running but not yet ready → wait page
+                return web.Response(
+                    text=WAIT_PAGE,
+                    content_type="text/html",
+                    headers={"Cache-Control": "no-store", "Connection": "close"},
+                )
+            else:
+                # Not running, not ready
+                if is_blocked():
+                    # Blocked by specific program (e.g., GPU in use) → refusal page
+                    return web.Response(
+                        text=REFUSAL_PAGE,
+                        content_type="text/html",
+                        headers={"Cache-Control": "no-store", "Connection": "close"},
+                    )
+                else:
+                    # Not blocked → start ComfyUI and show wait page
+                    await ensure_comfy_started()
+                    return web.Response(
+                        text=WAIT_PAGE,
+                        content_type="text/html",
+                        headers={"Cache-Control": "no-store", "Connection": "close"},
+                    )
 
-    # Proxy HTTP request
+    # If we reach here, it's ready and our instance → proxy the request
     if DECODE_PATHS and request.method == 'GET' and str(request.rel_url).startswith('/api/userdata'):
         decoded_path = unquote(request.rel_url.path)
         upstream_url = f"http://{COMFY_HOST}:{COMFY_PORT}{decoded_path}"
