@@ -199,17 +199,22 @@ async def start_comfy():
         cmd = [PYTHON_EXE, '-c', bootstrap] + COMFY_ARGS
     else:
         cmd = ["python", '-c', bootstrap] + COMFY_ARGS
-    _comfy_proc = subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-        creationflags=creationflags,
-        text=True,
-        bufsize=1,
-    )
-    print("[ComfyGate] ComfyUI started.")
+        
+    print(f"[ComfyGate] Launching ComfyUI with command: {' '.join(cmd)}")
+    try:
+        _comfy_proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+            text=True,
+            bufsize=1,
+        )
+        print("[ComfyGate] ComfyUI started.")
+    except Exception as e:
+        print(f"[ComfyGate] Failed to start ComfyUI: {e}")
     
     def monitor_proc():
         proc = _comfy_proc  # capture to avoid races if global is cleared
@@ -429,7 +434,14 @@ async def handle_health(request: web.Request):
         elif is_blocked():
             status = "blocked"
         else:
-            status = "stopped"
+            # potentially stopped: trigger start and recompute status
+            await ensure_comfy_started()
+            if comfy_running() and await comfy_ready(session):
+                status = "ready"
+            elif comfy_running():
+                status = "starting"
+            else:
+                status = "stopped"  # Failed to start for some reason
         if VERBOSE:
             print(f"ComfyUI status: {status}")
         return web.json_response({"status": status})
