@@ -67,7 +67,10 @@ COMFY_ARGS = ["--listen", "--port", str(COMFY_PORT), "--enable-cors-header", "--
 USER_DIR = Path(COMFY_DIR) / "user"
 BACKUP_USER_BEFORE_SHUTDOWN = False
 BACKUP_ROOT = Path(COMFY_DIR) / "user_backups"  # backups will be USER_DIR copied under this root
-
+CONFLICTING_PROCESSES = [
+        {"name": "python", "path": PYTHON_EXE},  # Always contains this process of course
+    ]
+    
 VERBOSE = True
 WS_TIMEOUT = True  #  Web sockets can time out
 ASYNCIO_TWEAKS = False  # [experimental] non-critical asyncio-related code (WindowsSelectorEventLoopPolicy)
@@ -116,7 +119,6 @@ def comfy_running() -> bool:  # process exists and has not ended
         return True
     return _comfy_proc is not None and _comfy_proc.poll() is None
 
-
 def is_blocked() -> bool:
     """
     Check if a blocking program (e.g., another VRAM-using app) is running.
@@ -124,20 +126,39 @@ def is_blocked() -> bool:
     Adjust this function if you have a different way to detect the specific program.
     """
     try:
-        output = subprocess.check_output(
-            ["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"],
+        # First check: blacklisted processes
+        for proc in CONFLICTING_PROCESSES:
+            ps_command = f"Get-Process -Name '{proc['name']}' -ErrorAction SilentlyContinue | Where-Object {{$_.Path -eq '{proc['path']}'}} | Select-Object -ExpandProperty Id"
+            output = subprocess.check_output(
+                ["powershell.exe", "-Command", ps_command],
+                text=True,
+                stderr=subprocess.DEVNULL
+            ).strip()
+            pids = [pid.strip() for pid in output.splitlines() if pid.strip()]
+            if VERBOSE and pids:
+                print(f"[ComfyGate] Existing {proc['name']} process from {proc['path']}: {', '.join(pids)}")
+            if pids:
+                return True  # Blocked if any such processes are running (since checked when !comfy_running())
+
+        # Second check: GPU memory usage
+        query_gpu_memory_used = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
             text=True,
             stderr=subprocess.DEVNULL
-        )
-        print(f"[ComfyGate] Listing compute processes on the GPU:\n{output}")
-        lines = output.strip().split('\n')
-        # If there are any lines (processes using GPU for compute), consider blocked
-        return bool(lines and any(line.strip() for line in lines))
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        # If nvidia-smi not found or fails, assume not blocked (or handle differently)
+        ).strip()
+        memory_used_mb = int(query_gpu_memory_used)  # in MiB
+        print(f"[ComfyGate] Checking GPU memory used: {memory_used_mb} MiB")
+        if memory_used_mb > 5000:  # Threshold; adjust if needed
+            return True
+            
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        # If commands fail, assume not blocked
+        print("[ComfyGate] Failed to query system resources; assuming not blocked")
         return False
 
-
+    return False  # if anything was blocking it would have returned True above
+    
+    
 async def comfy_ready(session: ClientSession) -> bool:
     try:  # try to get a response from ComfyUI
         async with session.get(f"http://{COMFY_HOST}:{COMFY_PORT}/", timeout=ClientTimeout(total=2)) as resp:
@@ -310,7 +331,7 @@ WAIT_PAGE = f"""
    }} catch (e) {{}}
    setTimeout(poll, 3000);
  }}
- poll();
+ setTimeout(poll, 3000);
 </script>
 """
 
@@ -340,7 +361,7 @@ REFUSAL_PAGE = f"""
 <div class="box">
   <h1>ComfyUI is blocked<br><span class="dots"></span></h1>
   <p>Another program is using resources (e.g., GPU). Please close any other AI applications or ComfyUI instances.</p>
-  <p>Checking again in 30 seconds. You’ll be redirected automatically when available.</p>
+  <p>Checking again every 30 seconds. You’ll be redirected automatically when available.</p>
   <p><small>If this persists, check the service logs or task manager.</small></p>
 </div>
 <script>
@@ -357,7 +378,7 @@ REFUSAL_PAGE = f"""
    }} catch (e) {{}}
    setTimeout(poll, 30000);
  }}
- poll();
+ setTimeout(poll, 30000);
 </script>
 """
 
