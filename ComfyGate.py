@@ -68,7 +68,7 @@ USER_DIR = Path(COMFY_DIR) / "user"
 BACKUP_USER_BEFORE_SHUTDOWN = False
 BACKUP_ROOT = Path(COMFY_DIR) / "user_backups"  # backups will be USER_DIR copied under this root
 CONFLICTING_PROCESSES = [
-        {"name": "python", "path": PYTHON_EXE},  # Always contains this process of course
+        {"name": "Python", "path": PYTHON_EXE},  # Always contains this process of course
     ]
     
 VERBOSE = True
@@ -130,16 +130,16 @@ def is_blocked() -> bool:
     try:
         # First check: blacklisted processes
         for proc in CONFLICTING_PROCESSES:
-            ps_command = f"Get-Process -Name '{proc['name']}' -ErrorAction SilentlyContinue | Where-Object {{$_.Path -eq '{proc['path']}'}} | Select-Object -ExpandProperty Id"
+            print(f"checking {proc['name']}: {proc['path']}")
+            ps_command = f"(Get-Process -Name {proc['name']} -ErrorAction SilentlyContinue).Path"
             output = subprocess.check_output(
                 ["powershell.exe", "-Command", ps_command],
                 text=True,
                 stderr=subprocess.DEVNULL
             ).strip()
-            pids = [pid.strip() for pid in output.splitlines() if pid.strip()]
-            if VERBOSE and pids:
-                print(f"[ComfyGate] Existing {proc['name']} process from {proc['path']}: {', '.join(pids)}")
-            if pids:
+            if proc['path'] in output.splitlines():
+                if VERBOSE:
+                    print(f"[ComfyGate] Blocked by existing {proc['name']}: {proc['path']}")
                 return True  # Blocked if any such processes are running (since checked when !comfy_running())
 
         # Second check: GPU memory usage
@@ -158,6 +158,7 @@ def is_blocked() -> bool:
         print("[ComfyGate] Failed to query system resources; assuming not blocked")
         return False
 
+    print("[ComfyGate] no blocking processes found")
     return False  # if anything was blocking it would have returned True above
     
     
@@ -238,21 +239,12 @@ async def stop_comfy():
         except Exception as e:
             print(f"[ComfyGate] Backup failed: {e}")
 
-    # Try graceful stop via Ctrl-C
+    # Try graceful stop via SIGINT
     try:
-        os.kill(_comfy_proc.pid, signal.CTRL_C_EVENT)
+        os.kill(_comfy_proc.pid, signal.SIGINT)
         await asyncio.sleep(10)
     except Exception as e:  # Catch any signal send failures (e.g., permission, invalid signal)
-        print(f"[ComfyGate] WARNING: Graceful signal(Ctrl-C) failed to shutdown ComfyUI: {e}")
-
-    # If still alive, SIGINT
-    if _comfy_proc.poll() is None:
-        try:
-            print("[ComfyGate] WARNING: Graceful shutdown timed out, attempting SIGINT")
-            os.kill(_comfy_proc.pid, signal.SIGINT)
-            await asyncio.sleep(10)
-        except Exception as e:  # Catch any signal send failures (e.g., permission, invalid signal)
-            print(f"[ComfyGate] WARNING: SIGINT failed to shutdown ComfyUI: {e}")
+        print(f"[ComfyGate] WARNING: Graceful signal(SIGINT) failed to shutdown ComfyUI: {e}")
 
     # If still alive, Ctrl-Break
     if _comfy_proc.poll() is None:
@@ -299,7 +291,7 @@ WAIT_PAGE = f"""
 <style>
   body {{ font-family: system-ui, sans-serif; display:grid; place-items:center; height:100dvh; margin:0; }}
   .box {{ text-align:center; max-width: 42rem; padding: 2rem; }}
-  .dots::after {{ content: '[..........]'; animation: dots 38s steps(10, end); white-space: pre; font-family: monospace; }}
+  .dots::after {{ content: '[..........]'; animation: dots 50s steps(10, end); white-space: pre; font-family: monospace; }}
   @keyframes dots {{
     0% {{ content: '[          ]'; }}
     10% {{ content: '[.         ]'; }}
@@ -392,10 +384,14 @@ async def handle_health(request: web.Request):
             status = "ready"
         elif comfy_running():  # process exists and has not ended
             status = "starting"
+        elif _shutting_down:
+            status = "shutting down"
         elif is_blocked():
             status = "blocked"
         else:
             status = "stopped"
+        if VERBOSE:
+            print(f"ComfyUI status: {status}")
         return web.json_response({"status": status})
 
 
@@ -413,7 +409,8 @@ async def proxy_ws(request: web.Request):
     timed_out = False
     
     # Ensure upstream exists (start if needed)
-    await ensure_comfy_started()
+    #if not comfy_running() and not is_blocked():
+    #    await ensure_comfy_started()  # not sure wether we want ws to be able to boot comfy
 
     ws_server = web.WebSocketResponse(compress=0)
     await ws_server.prepare(request)
@@ -534,7 +531,7 @@ async def proxy_http(request: web.Request):
                 content_type="text/html",
                 headers={"Cache-Control": "no-store", "Connection": "close"},
             )
-        elif is_blocked():
+        elif (not _shutting_down) and is_blocked():
             status = "blocked"  #  Blocked by other program (e.g., GPU in use) → refusal page
             return web.Response(
                 text=REFUSAL_PAGE,
@@ -550,6 +547,8 @@ async def proxy_http(request: web.Request):
                 content_type="text/html",
                 headers={"Cache-Control": "no-store", "Connection": "close"},
             )
+        if VERBOSE:
+            print(f"ComfyUI status: {status}")
 
     # If we reach here, it's ready and our instance → proxy the request
     if DECODE_PATHS and request.method == 'GET' and str(request.rel_url).startswith('/api/userdata'):
@@ -614,6 +613,7 @@ def make_app() -> web.Application:
 
 
 async def main():
+    global _shutting_down
     app = make_app()
     runner = web.AppRunner(app)
     await runner.setup()
