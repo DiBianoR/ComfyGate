@@ -283,11 +283,49 @@ async def idle_watchdog():
             print(f"[ComfyGate] Idle for {int(idle_for)}s, [Warning]{int(_active_ws)} active websockets → stopping ComfyUI…")
             await stop_comfy()
 
-WAIT_PAGE = f"""
+STATUS_MESSAGES = {
+    "starting": {
+        "title": "Warming up ComfyUI",
+        "message": "This can take a moment the first time after a reboot. You’ll be redirected automatically when it’s ready.",
+        "note": "If this page doesn’t advance after a while, check the service logs.",
+        "interval": 3000,
+    },
+    "stopped": {
+        "title": "ComfyUI is stopped",
+        "message": "The server is currently stopped due to inactivity. It will start automatically on refresh or new request.",
+        "note": "If unexpected, check the service logs.",
+        "interval": 3000,
+    },
+    "blocked": {
+        "title": "ComfyUI is blocked",
+        "message": "Another program is using resources (e.g., GPU). Please close any other AI applications or ComfyUI instances.",
+        "note": "If this persists, check the service logs or task manager.",
+        "interval": 30000,
+    },
+    "shutting_down": {
+        "title": "Shutting down ComfyUI",
+        "message": "The server is shutting down due to inactivity or a stop signal. You’ll be redirected when ready again.",
+        "note": "If unexpected, check the service logs.",
+        "interval": 3000,
+    },
+    "error": {
+        "title": "Error connecting to gate",
+        "message": "Cannot reach the proxy server. It may be down, restarting, or there is a network issue.",
+        "note": "Check the service status and logs.",
+        "interval": 10000,
+    },
+}
+
+
+def get_status_page(status: str) -> str:
+    if status not in STATUS_MESSAGES:
+        status = "error"  # Fallback
+    msg = STATUS_MESSAGES[status]
+    return f"""
 <!doctype html>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Starting ComfyUI…</title>
+<title>ComfyUI Status</title>
 <style>
   body {{ font-family: system-ui, sans-serif; display:grid; place-items:center; height:100dvh; margin:0; }}
   .box {{ text-align:center; max-width: 42rem; padding: 2rem; }}
@@ -307,72 +345,74 @@ WAIT_PAGE = f"""
   }}
 </style>
 <div class="box">
-  <h1>Warming up ComfyUI<br><span class="dots"></span></h1>
-  <p>This can take a moment the first time after a reboot. You’ll be redirected automatically when it’s ready.</p>
-  <p><small>If this page doesn’t advance after a while, check the service logs.</small></p>
+  <h1 id="title">{msg['title']}<br><span class="dots"></span></h1>
+  <p id="message">{msg['message']}</p>
+  <p id="note"><small>{msg['note']}</small></p>
 </div>
 <script>
- async function poll() {{
-   try {{
-     const r = await fetch('/__comfygate/health', {{cache: 'no-store'}});
-     if (r.ok) {{
-       const j = await r.json();
-       if (j.status === 'ready') {{
-         window.location.reload();
-         return;
-       }}
-     }}
-   }} catch (e) {{}}
-   setTimeout(poll, 3000);
- }}
- setTimeout(poll, 3000);
-</script>
-"""
+const STATUS_MESSAGES = {{
+  "starting": {{
+    "title": "Warming up ComfyUI",
+    "message": "This can take a moment the first time after a reboot. You’ll be redirected automatically when it’s ready.",
+    "note": "If this page doesn’t advance after a while, check the service logs.",
+    "interval": 3000,
+  }},
+  "stopped": {{
+    "title": "ComfyUI is stopped",
+    "message": "The server is currently stopped due to inactivity. It will start automatically on refresh or new request.",
+    "note": "If unexpected, check the service logs.",
+    "interval": 3000,
+  }},
+  "blocked": {{
+    "title": "ComfyUI is blocked",
+    "message": "Another program is using resources (e.g., GPU). Please close any other AI applications or ComfyUI instances.",
+    "note": "If this persists, check the service logs or task manager.",
+    "interval": 30000,
+  }},
+  "shutting_down": {{
+    "title": "Shutting down ComfyUI",
+    "message": "The server is shutting down due to inactivity or a stop signal. You’ll be redirected when ready again.",
+    "note": "If unexpected, check the service logs.",
+    "interval": 3000,
+  }},
+  "error": {{
+    "title": "Error connecting to gate",
+    "message": "Cannot reach the proxy server. It may be down, restarting, or there is a network issue.",
+    "note": "Check the service status and logs.",
+    "interval": 10000,
+  }},
+}};
 
-REFUSAL_PAGE = f"""
-<!doctype html>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>ComfyUI Blocked</title>
-<style>
-  body {{ font-family: system-ui, sans-serif; display:grid; place-items:center; height:100dvh; margin:0; }}
-  .box {{ text-align:center; max-width: 42rem; padding: 2rem; }}
-  .dots::after {{ content: '…'; animation: dots 30s steps(10, end) infinite; white-space: pre; font-family: monospace; }}
-  @keyframes dots {{
-    0% {{ content: '[          ]'; }}
-    10% {{ content: '[.         ]'; }}
-    20% {{ content: '[..        ]'; }}
-    30% {{ content: '[...       ]'; }}
-    40% {{ content: '[....      ]'; }}
-    50% {{ content: '[.....     ]'; }}
-    60% {{ content: '[......    ]'; }}
-    70% {{ content: '[.......   ]'; }}
-    80% {{ content: '[........  ]'; }}
-    90% {{ content: '[......... ]'; }}
-    100% {{ content: '[..........]'; }}
+function update_content(status) {{
+  if (!STATUS_MESSAGES.hasOwnProperty(status)) return;
+  const msg = STATUS_MESSAGES[status];
+  document.getElementById('title').innerHTML = `${{msg.title}}<br><span class="dots"></span>`;
+  document.getElementById('message').textContent = msg.message;
+  document.getElementById('note').innerHTML = msg.note ? `<small>${{msg.note}}</small>` : '';
+}}
+
+async function poll() {{
+  try {{
+    const r = await fetch('/__comfygate/health', {{cache: 'no-store'}});
+    if (r.ok) {{
+      const j = await r.json();
+      update_content(j.status);
+      if (j.status === 'ready') {{
+        window.location.reload();
+        return;
+      }} else {{
+        setTimeout(poll, STATUS_MESSAGES[j.status].interval || 3000);
+      }}
+    }} else {{
+      update_content('error');
+      setTimeout(poll, STATUS_MESSAGES['error'].interval);
+    }}
+  }} catch (e) {{
+    update_content('error');
+    setTimeout(poll, STATUS_MESSAGES['error'].interval);
   }}
-</style>
-<div class="box">
-  <h1>ComfyUI is blocked<br><span class="dots"></span></h1>
-  <p>Another program is using resources (e.g., GPU). Please close any other AI applications or ComfyUI instances.</p>
-  <p>Checking again every 30 seconds. You’ll be redirected automatically when available.</p>
-  <p><small>If this persists, check the service logs or task manager.</small></p>
-</div>
-<script>
- async function poll() {{
-   try {{
-     const r = await fetch('/__comfygate/health', {{cache: 'no-store'}});
-     if (r.ok) {{
-       const j = await r.json();
-       if (j.status !== 'blocked') {{
-         window.location.reload();
-         return;
-       }}
-     }}
-   }} catch (e) {{}}
-   setTimeout(poll, 30000);
- }}
- setTimeout(poll, 30000);
+}}
+setTimeout(poll, {msg['interval']});
 </script>
 """
 
@@ -385,7 +425,7 @@ async def handle_health(request: web.Request):
         elif comfy_running():  # process exists and has not ended
             status = "starting"
         elif _shutting_down:
-            status = "shutting down"
+            status = "shutting_down"
         elif is_blocked():
             status = "blocked"
         else:
@@ -527,14 +567,21 @@ async def proxy_http(request: web.Request):
             status = "starting"
             # Our instance is running but not yet ready → wait page
             return web.Response(
-                text=WAIT_PAGE,
+                text=get_status_page("starting"),
                 content_type="text/html",
                 headers={"Cache-Control": "no-store", "Connection": "close"},
             )
-        elif (not _shutting_down) and is_blocked():
+        elif _shutting_down:
+            status = "shutting_down"
+            return web.Response(
+                text=get_status_page("shutting_down"),
+                content_type="text/html",
+                headers={"Cache-Control": "no-store", "Connection": "close"},
+            )
+        elif is_blocked():
             status = "blocked"  #  Blocked by other program (e.g., GPU in use) → refusal page
             return web.Response(
-                text=REFUSAL_PAGE,
+                text=get_status_page("blocked"),
                 content_type="text/html",
                 headers={"Cache-Control": "no-store", "Connection": "close"},
             )
@@ -543,7 +590,7 @@ async def proxy_http(request: web.Request):
             # Not blocked → start ComfyUI and show wait page
             await ensure_comfy_started()
             return web.Response(
-                text=WAIT_PAGE,
+                text=get_status_page("starting"),
                 content_type="text/html",
                 headers={"Cache-Control": "no-store", "Connection": "close"},
             )
