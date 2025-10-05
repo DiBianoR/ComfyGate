@@ -111,7 +111,7 @@ def activity_tick():
     _last_activity = time.monotonic()
 
 
-def comfy_running() -> bool:
+def comfy_running() -> bool:  # process exists and has not ended
     if USE_EXTERNAL_COMFYUI:
         return True
     return _comfy_proc is not None and _comfy_proc.poll() is None
@@ -129,6 +129,7 @@ def is_blocked() -> bool:
             text=True,
             stderr=subprocess.DEVNULL
         )
+        print(f"[ComfyGate] Listing compute processes on the GPU:\n{output}")
         lines = output.strip().split('\n')
         # If there are any lines (processes using GPU for compute), consider blocked
         return bool(lines and any(line.strip() for line in lines))
@@ -138,7 +139,7 @@ def is_blocked() -> bool:
 
 
 async def comfy_ready(session: ClientSession) -> bool:
-    try:
+    try:  # try to get a response from ComfyUI
         async with session.get(f"http://{COMFY_HOST}:{COMFY_PORT}/", timeout=ClientTimeout(total=2)) as resp:
             return resp.status == 200
     except Exception:
@@ -147,7 +148,7 @@ async def comfy_ready(session: ClientSession) -> bool:
 
 async def start_comfy():
     global _comfy_proc
-    if comfy_running():
+    if comfy_running():  # process exists and has not ended
         return
 
     # Ensure working directory
@@ -200,7 +201,7 @@ async def start_comfy():
 
 async def stop_comfy():
     global _comfy_proc
-    if not comfy_running() or USE_EXTERNAL_COMFYUI:
+    if not comfy_running() or USE_EXTERNAL_COMFYUI:  # process doesn't exist, has ended, or is external
         return
 
     # Optional backup
@@ -275,23 +276,23 @@ WAIT_PAGE = f"""
 <style>
   body {{ font-family: system-ui, sans-serif; display:grid; place-items:center; height:100dvh; margin:0; }}
   .box {{ text-align:center; max-width: 42rem; padding: 2rem; }}
-  .dots::after {{ content: '..........'; animation: dots 25s steps(10, end); }}
+  .dots::after {{ content: '…'; animation: dots 25s steps(10, end); white-space: pre; font-family: monospace; }}
   @keyframes dots {{
-    0% {{ content: ''; }}
-    10% {{ content: '.'; }}
-    20% {{ content: '..'; }}
-    30% {{ content: '...'; }}
-    40% {{ content: '....'; }}
-    50% {{ content: '.....'; }}
-    60% {{ content: '......'; }}
-    70% {{ content: '.......'; }}
-    80% {{ content: '........'; }}
-    90% {{ content: '.........'; }}
-    100% {{ content: '..........'; }}
+    0% {{ content: '[          ]'; }}
+    10% {{ content: '[.         ]'; }}
+    20% {{ content: '[..        ]'; }}
+    30% {{ content: '[...       ]'; }}
+    40% {{ content: '[....      ]'; }}
+    50% {{ content: '[.....     ]'; }}
+    60% {{ content: '[......    ]'; }}
+    70% {{ content: '[.......   ]'; }}
+    80% {{ content: '[........  ]'; }}
+    90% {{ content: '[......... ]'; }}
+    100% {{ content: '[..........]'; }}
   }}
 </style>
 <div class="box">
-  <h1>Warming up ComfyUI<span class="dots"></span></h1>
+  <h1>Warming up ComfyUI<br><span class="dots"></span></h1>
   <p>This can take a moment the first time after a reboot. You’ll be redirected automatically when it’s ready.</p>
   <p><small>If this page doesn’t advance after a while, check the service logs.</small></p>
 </div>
@@ -321,23 +322,23 @@ REFUSAL_PAGE = f"""
 <style>
   body {{ font-family: system-ui, sans-serif; display:grid; place-items:center; height:100dvh; margin:0; }}
   .box {{ text-align:center; max-width: 42rem; padding: 2rem; }}
-  .dots::after {{ content: '..........'; animation: dots 30s steps(10, end) infinite; }}
+  .dots::after {{ content: '…'; animation: dots 30s steps(10, end) infinite; white-space: pre; font-family: monospace; }}
   @keyframes dots {{
-    0% {{ content: ''; }}
-    10% {{ content: '.'; }}
-    20% {{ content: '..'; }}
-    30% {{ content: '...'; }}
-    40% {{ content: '....'; }}
-    50% {{ content: '.....'; }}
-    60% {{ content: '......'; }}
-    70% {{ content: '.......'; }}
-    80% {{ content: '........'; }}
-    90% {{ content: '.........'; }}
-    100% {{ content: '..........'; }}
+    0% {{ content: '[          ]'; }}
+    10% {{ content: '[.         ]'; }}
+    20% {{ content: '[..        ]'; }}
+    30% {{ content: '[...       ]'; }}
+    40% {{ content: '[....      ]'; }}
+    50% {{ content: '[.....     ]'; }}
+    60% {{ content: '[......    ]'; }}
+    70% {{ content: '[.......   ]'; }}
+    80% {{ content: '[........  ]'; }}
+    90% {{ content: '[......... ]'; }}
+    100% {{ content: '[..........]'; }}
   }}
 </style>
 <div class="box">
-  <h1>ComfyUI is blocked<span class="dots"></span></h1>
+  <h1>ComfyUI is blocked<br><span class="dots"></span></h1>
   <p>Another program is using resources (e.g., GPU). Please close any other AI applications or ComfyUI instances.</p>
   <p>Checking again in 30 seconds. You’ll be redirected automatically when available.</p>
   <p><small>If this persists, check the service logs or task manager.</small></p>
@@ -362,30 +363,29 @@ REFUSAL_PAGE = f"""
 
 
 async def handle_health(request: web.Request):
-    activity_tick()
     async with ClientSession() as session:
-        ready = await comfy_ready(session)
+        ready = await comfy_ready(session)  # try to get a response from ComfyUI
         if ready:
             status = "ready"
-        elif comfy_running():
+        elif comfy_running():  # process exists and has not ended
             status = "starting"
         elif is_blocked():
             status = "blocked"
         else:
-            status = "idle"
+            status = "stopped"
         return web.json_response({"status": status})
 
 
 async def ensure_comfy_started():
     async with _starting_lock:
-        if comfy_running():
+        if comfy_running():  # process exists and has not ended
             return
         await start_comfy()
 
 
 async def proxy_ws(request: web.Request):
     global _active_ws
-    activity_tick()                         # global _last_activity: for all websockets, http, and handle_health
+    activity_tick()                         # global _last_activity: for all websockets & http
     local_last_activity = time.monotonic()  # for just this websocket
     timed_out = False
     
@@ -499,9 +499,9 @@ async def proxy_http(request: web.Request):
         return await proxy_ws(request)
 
     async with ClientSession() as session:
-        ready = await comfy_ready(session)
+        ready = await comfy_ready(session)  # try to get a response from ComfyUI
         if ready:
-            if comfy_running():
+            if comfy_running():  # process exists and has not ended
                 # Proxy normally if our instance is running
                 pass
             else:
@@ -512,7 +512,7 @@ async def proxy_http(request: web.Request):
                     headers={"Cache-Control": "no-store", "Connection": "close"},
                 )
         else:
-            if comfy_running():
+            if comfy_running():  # process exists and has not ended
                 # Our instance is running but not yet ready → wait page
                 return web.Response(
                     text=WAIT_PAGE,
