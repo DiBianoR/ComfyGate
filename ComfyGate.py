@@ -89,6 +89,7 @@ _comfy_proc: Optional[subprocess.Popen] = None
 _starting_lock = asyncio.Lock()
 _last_activity = time.monotonic()
 _active_ws = 0
+_shutting_down = False
 
 header_forwarding_policy = 'whitelist'  # 'blacklist' or 'whitelist'
 WHITELISTED_HEADERS = {
@@ -125,6 +126,7 @@ def is_blocked() -> bool:
     Here, we use nvidia-smi to check for any compute processes on the GPU.
     Adjust this function if you have a different way to detect the specific program.
     """
+
     try:
         # First check: blacklisted processes
         for proc in CONFLICTING_PROCESSES:
@@ -169,7 +171,7 @@ async def comfy_ready(session: ClientSession) -> bool:
 
 async def start_comfy():
     global _comfy_proc
-    if comfy_running():  # process exists and has not ended
+    if comfy_running() or _shutting_down:  # process exists and has not ended
         return
 
     # Ensure working directory
@@ -297,7 +299,7 @@ WAIT_PAGE = f"""
 <style>
   body {{ font-family: system-ui, sans-serif; display:grid; place-items:center; height:100dvh; margin:0; }}
   .box {{ text-align:center; max-width: 42rem; padding: 2rem; }}
-  .dots::after {{ content: '…'; animation: dots 25s steps(10, end); white-space: pre; font-family: monospace; }}
+  .dots::after {{ content: '[..........]'; animation: dots 38s steps(10, end); white-space: pre; font-family: monospace; }}
   @keyframes dots {{
     0% {{ content: '[          ]'; }}
     10% {{ content: '[.         ]'; }}
@@ -385,8 +387,8 @@ REFUSAL_PAGE = f"""
 
 async def handle_health(request: web.Request):
     async with ClientSession() as session:
-        ready = await comfy_ready(session)  # try to get a response from ComfyUI
-        if ready:
+
+        if comfy_running() and await comfy_ready(session):  # try to get a response from ComfyUI
             status = "ready"
         elif comfy_running():  # process exists and has not ended
             status = "starting"
@@ -520,43 +522,34 @@ async def proxy_http(request: web.Request):
         return await proxy_ws(request)
 
     async with ClientSession() as session:
-        ready = await comfy_ready(session)  # try to get a response from ComfyUI
-        if ready:
-            if comfy_running():  # process exists and has not ended
-                # Proxy normally if our instance is running
-                pass
-            else:
-                # Another instance (not launched by us) is responding on the port → refusal
-                return web.Response(
-                    text=REFUSAL_PAGE,
-                    content_type="text/html",
-                    headers={"Cache-Control": "no-store", "Connection": "close"},
-                )
+
+        if comfy_running() and await comfy_ready(session):  # try to get a response from ComfyUI
+            status = "ready"
+            pass  # Proxy normally if our instance is running
+        elif comfy_running():  # process exists and has not ended
+            status = "starting"
+            # Our instance is running but not yet ready → wait page
+            return web.Response(
+                text=WAIT_PAGE,
+                content_type="text/html",
+                headers={"Cache-Control": "no-store", "Connection": "close"},
+            )
+        elif is_blocked():
+            status = "blocked"  #  Blocked by other program (e.g., GPU in use) → refusal page
+            return web.Response(
+                text=REFUSAL_PAGE,
+                content_type="text/html",
+                headers={"Cache-Control": "no-store", "Connection": "close"},
+            )
         else:
-            if comfy_running():  # process exists and has not ended
-                # Our instance is running but not yet ready → wait page
-                return web.Response(
-                    text=WAIT_PAGE,
-                    content_type="text/html",
-                    headers={"Cache-Control": "no-store", "Connection": "close"},
-                )
-            else:
-                # Not running, not ready
-                if is_blocked():
-                    # Blocked by specific program (e.g., GPU in use) → refusal page
-                    return web.Response(
-                        text=REFUSAL_PAGE,
-                        content_type="text/html",
-                        headers={"Cache-Control": "no-store", "Connection": "close"},
-                    )
-                else:
-                    # Not blocked → start ComfyUI and show wait page
-                    await ensure_comfy_started()
-                    return web.Response(
-                        text=WAIT_PAGE,
-                        content_type="text/html",
-                        headers={"Cache-Control": "no-store", "Connection": "close"},
-                    )
+            status = "stopped"
+            # Not blocked → start ComfyUI and show wait page
+            await ensure_comfy_started()
+            return web.Response(
+                text=WAIT_PAGE,
+                content_type="text/html",
+                headers={"Cache-Control": "no-store", "Connection": "close"},
+            )
 
     # If we reach here, it's ready and our instance → proxy the request
     if DECODE_PATHS and request.method == 'GET' and str(request.rel_url).startswith('/api/userdata'):
@@ -634,6 +627,7 @@ async def main():
         while True:
             await asyncio.sleep(3600)
     finally:
+        _shutting_down = True
         print("[ComfyGate] Shutting down...")
         await app.shutdown()  # Runs on_shutdown handlers
         await stop_comfy()
