@@ -443,7 +443,7 @@ async def handle_health(request: web.Request):
             else:
                 status = "stopped"  # Failed to start for some reason
         if VERBOSE:
-            print(f"ComfyUI status: {status}")
+            print(f"[handle_health] ComfyUI status: {status}")
         return web.json_response({"status": status})
 
 
@@ -606,8 +606,8 @@ async def proxy_http(request: web.Request):
                 content_type="text/html",
                 headers={"Cache-Control": "no-store", "Connection": "close"},
             )
-        if VERBOSE:
-            print(f"ComfyUI status: {status}")
+        if VERBOSE and status != "ready":
+            print(f"[proxy_http] ComfyUI status: {status}")
 
     # If we reach here, it's ready and our instance → proxy the request
     if DECODE_PATHS and request.method == 'GET' and str(request.rel_url).startswith('/api/userdata'):
