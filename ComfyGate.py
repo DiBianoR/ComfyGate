@@ -28,7 +28,14 @@ Notes
   it terminates the process.
 """
 
-from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
+from aiohttp import (
+    web,
+    ClientSession,
+    ClientTimeout,
+    WSMsgType,
+    ClientError,
+    ClientWebSocketResponse,
+)
 import asyncio
 import contextlib
 from datetime import datetime
@@ -40,7 +47,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Dict, Optional
 from urllib.parse import unquote
 import yarl
 
@@ -90,6 +97,7 @@ _starting_lock = asyncio.Lock()
 _last_activity = time.monotonic()
 _active_ws = 0
 _shutting_down = False
+_http_client: Optional[ClientSession] = None
 
 header_forwarding_policy = 'whitelist'  # 'blacklist' or 'whitelist'
 WHITELISTED_HEADERS = {
@@ -113,6 +121,14 @@ BLACKLISTED_HEADERS = {"Host", "Connection", "Upgrade", "Proxy-Authorization", "
 def activity_tick():
     global _last_activity
     _last_activity = time.monotonic()
+
+
+def get_http_client() -> ClientSession:
+    global _http_client
+    if _http_client is None or _http_client.closed:
+        timeout = ClientTimeout(total=None, sock_connect=30, sock_read=None)
+        _http_client = ClientSession(timeout=timeout, trust_env=False)
+    return _http_client
 
 
 def comfy_running() -> bool:  # process exists and has not ended
@@ -423,28 +439,28 @@ setTimeout(poll, {msg['interval']});
 
 
 async def handle_health(request: web.Request):
-    async with ClientSession() as session:
+    session = get_http_client()
 
-        if comfy_running() and await comfy_ready(session):  # try to get a response from ComfyUI
+    if comfy_running() and await comfy_ready(session):  # try to get a response from ComfyUI
+        status = "ready"
+    elif comfy_running():  # process exists and has not ended
+        status = "starting"
+    elif _shutting_down:
+        status = "shutting_down"
+    elif is_blocked():
+        status = "blocked"
+    else:
+        # potentially stopped: trigger start and recompute status
+        await ensure_comfy_started()
+        if comfy_running() and await comfy_ready(session):
             status = "ready"
-        elif comfy_running():  # process exists and has not ended
+        elif comfy_running():
             status = "starting"
-        elif _shutting_down:
-            status = "shutting_down"
-        elif is_blocked():
-            status = "blocked"
         else:
-            # potentially stopped: trigger start and recompute status
-            await ensure_comfy_started()
-            if comfy_running() and await comfy_ready(session):
-                status = "ready"
-            elif comfy_running():
-                status = "starting"
-            else:
-                status = "stopped"  # Failed to start for some reason
-        if VERBOSE:
-            print(f"[handle_health] ComfyUI status: {status}")
-        return web.json_response({"status": status})
+            status = "stopped"  # Failed to start for some reason
+    if VERBOSE:
+        print(f"[handle_health] ComfyUI status: {status}")
+    return web.json_response({"status": status})
 
 
 async def ensure_comfy_started():
@@ -456,111 +472,184 @@ async def ensure_comfy_started():
 
 async def proxy_ws(request: web.Request):
     global _active_ws
-    activity_tick()                         # global _last_activity: for all websockets & http
-    local_last_activity = time.monotonic()  # for just this websocket
-    timed_out = False
-    
-    # Ensure upstream exists (start if needed)
-    #if not comfy_running() and not is_blocked():
-    #    await ensure_comfy_started()  # not sure wether we want ws to be able to boot comfy
-
+    activity_tick()
     ws_server = web.WebSocketResponse(compress=0)
     await ws_server.prepare(request)
     _active_ws += 1
-    print(f"[ComfyGate] Opened new WebSocket")
+    print("[ComfyGate] Opened new WebSocket")
 
-    if DECODE_PATHS and request.method == 'GET' and str(request.rel_url).startswith('/api/userdata'):
+    if DECODE_PATHS and request.method == "GET" and str(request.rel_url).startswith("/api/userdata"):
         decoded_path = unquote(request.rel_url.path)
         upstream_url = f"http://{COMFY_HOST}:{COMFY_PORT}{decoded_path}"
         if request.rel_url.query_string:
-            upstream_url += '?' + request.rel_url.query_string
+            upstream_url += "?" + request.rel_url.query_string
         if VERBOSE:
             print(f"[ComfyGate](ws) Original upstream: http://{COMFY_HOST}:{COMFY_PORT}{request.rel_url}")
             print(f"[ComfyGate](ws) Decoded upstream: {upstream_url}")
     else:
         upstream_url = f"http://{COMFY_HOST}:{COMFY_PORT}{request.rel_url}"
-    
-    # Minimal, safe headers; let aiohttp generate Sec-WebSocket-* itself.
-    headers = {}
-    for k in ("User-Agent", "Origin", "Cookie"):
-        v = request.headers.get(k)
-        if v:
-            headers[k] = v
-    sp = request.headers.get("Sec-WebSocket-Protocol")
-    if sp:
-        headers["Sec-WebSocket-Protocol"] = sp
+
+    headers: Dict[str, str] = {}
+    for key in ("User-Agent", "Origin", "Cookie"):
+        value = request.headers.get(key)
+        if value:
+            headers[key] = value
+    protocol_header = request.headers.get("Sec-WebSocket-Protocol")
+    if protocol_header:
+        headers["Sec-WebSocket-Protocol"] = protocol_header
     headers["Host"] = f"{COMFY_HOST}:{COMFY_PORT}"
 
+    session = get_http_client()
+    last_activity = time.monotonic()
+    stop_event = asyncio.Event()
+    closed_by = "unknown"
+    timed_out = False
+    ws_client: Optional[ClientWebSocketResponse] = None
+
+    async def close_pair(*, code: int = 1000, message: Optional[bytes] = None, reason: Optional[str] = None, mark_timeout: bool = False):
+        nonlocal timed_out, closed_by, ws_client
+        if stop_event.is_set():
+            return
+        if mark_timeout:
+            timed_out = True
+            if closed_by == "unknown":
+                closed_by = "timeout"
+        elif reason and closed_by == "unknown":
+            closed_by = reason
+        stop_event.set()
+        payload: bytes
+        if message is None:
+            payload = b""
+        elif isinstance(message, bytes):
+            payload = message
+        else:
+            payload = str(message).encode("utf-8", "ignore")
+        if ws_client is not None:
+            with contextlib.suppress(Exception):
+                await ws_client.close(code=code, message=payload)
+        with contextlib.suppress(Exception):
+            await ws_server.close(code=code, message=payload)
+
     try:
-        async with ClientSession() as session:
-            async with session.ws_connect(upstream_url, headers=headers, compress=0, autoping=True, autoclose=True, timeout=10) as ws_client:
-                async def ws_to_upstream():
-                    nonlocal local_last_activity
+        async with session.ws_connect(
+            upstream_url,
+            headers=headers,
+            compress=0,
+            autoping=True,
+            autoclose=False,
+            receive_timeout=None,
+        ) as upstream_ws:
+            ws_client = upstream_ws
+
+            async def relay_client_to_upstream():
+                nonlocal last_activity
+                try:
                     async for msg in ws_server:
                         activity_tick()
-                        local_last_activity = time.monotonic()
+                        last_activity = time.monotonic()
                         if msg.type == WSMsgType.TEXT:
                             await ws_client.send_str(msg.data)
                         elif msg.type == WSMsgType.BINARY:
                             await ws_client.send_bytes(msg.data)
                         elif msg.type in (WSMsgType.PING, WSMsgType.PONG):
-                            continue  # autoping handles it
+                            continue
                         elif msg.type == WSMsgType.CLOSE:
-                            await ws_client.close()
+                            await close_pair(code=msg.data or 1000, reason="client")
+                            return
                         elif msg.type == WSMsgType.ERROR:
-                            print(f"[ComfyGate] client sent message type ERROR")
-                            break
+                            if VERBOSE:
+                                print("[ComfyGate] client websocket reported ERROR message")
+                            await close_pair(code=1011, reason="client-error")
+                            return
                         else:
-                            print(f"[ComfyGate] client sent unhandled message type {msg.type}")
+                            if VERBOSE:
+                                print(f"[ComfyGate] client sent unhandled message type {msg.type}")
+                    await close_pair(reason="client")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if VERBOSE:
+                        print(f"[ComfyGate] client relay failed: {exc}")
+                    await close_pair(code=1011, reason="client-error")
 
-                async def upstream_to_ws():
-                    nonlocal local_last_activity
+            async def relay_upstream_to_client():
+                nonlocal last_activity
+                try:
                     async for msg in ws_client:
                         activity_tick()
-                        local_last_activity = time.monotonic()
+                        last_activity = time.monotonic()
                         if msg.type == WSMsgType.TEXT:
                             await ws_server.send_str(msg.data)
                         elif msg.type == WSMsgType.BINARY:
                             await ws_server.send_bytes(msg.data)
                         elif msg.type in (WSMsgType.PING, WSMsgType.PONG):
-                            continue  # autoping handles it
+                            continue
                         elif msg.type == WSMsgType.CLOSE:
-                            break
+                            await close_pair(code=msg.data or 1000, reason="upstream")
+                            return
                         elif msg.type == WSMsgType.ERROR:
-                            print(f"[ComfyGate] server returned message type ERROR")
-                            break
+                            if VERBOSE:
+                                print("[ComfyGate] upstream websocket reported ERROR message")
+                            await close_pair(code=1011, reason="upstream-error")
+                            return
                         else:
-                            print(f"[ComfyGate] server returned unhandled message type {msg.type}")
-                            
-                async def ws_timeout_monitor():
-                    nonlocal local_last_activity, timed_out
-                    while True:
-                        await asyncio.sleep(CHECK_PERIOD_SECS)
-                        idle_for = time.monotonic() - local_last_activity
+                            if VERBOSE:
+                                print(f"[ComfyGate] upstream sent unhandled message type {msg.type}")
+                    await close_pair(reason="upstream")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if VERBOSE:
+                        print(f"[ComfyGate] upstream relay failed: {exc}")
+                    await close_pair(code=1011, reason="upstream-error")
+
+            async def idle_monitor():
+                nonlocal last_activity
+                while not stop_event.is_set():
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=CHECK_PERIOD_SECS)
+                        return
+                    except asyncio.TimeoutError:
+                        idle_for = time.monotonic() - last_activity
                         if idle_for >= INACTIVITY_TIMEOUT_WS:
                             print(f"[ComfyGate] Closing inactive WebSocket after {int(idle_for)}s")
-                            timed_out = True
-                            with contextlib.suppress(Exception):  # Close upstream first
-                                await ws_client.close(code=1000, message=b"idle timeout")
-                                await ws_client.wait_closed()
-                            await asyncio.sleep(0.2)
-                            with contextlib.suppress(Exception):  # Then client-side
-                                await ws_server.close(code=1000, message=b"idle timeout")
-                            break  # Exit monitor task
+                            await close_pair(code=1000, message=b"idle timeout", mark_timeout=True)
+                            return
 
-                try:
-                    if WS_TIMEOUT:
-                        await asyncio.gather(ws_to_upstream(), upstream_to_ws(), ws_timeout_monitor())
-                    else:
-                        await asyncio.gather(ws_to_upstream(), upstream_to_ws())
-                except (ConnectionResetError, asyncio.CancelledError):
-                    pass
-    finally:
-        if not timed_out:
-            print(f"[ComfyGate] WebSocket Closed")
+            tasks = [
+                asyncio.create_task(relay_client_to_upstream()),
+                asyncio.create_task(relay_upstream_to_client()),
+            ]
+            if WS_TIMEOUT:
+                tasks.append(asyncio.create_task(idle_monitor()))
+
+            try:
+                await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                for task in tasks:
+                    with contextlib.suppress(Exception):
+                        await task
+
+    except ClientError as exc:
+        if VERBOSE:
+            print(f"[ComfyGate] Failed to connect upstream websocket: {exc}")
+        await ws_server.close(code=1011, message=b"upstream unavailable")
+        closed_by = "connect-error"
+    except Exception as exc:
+        if VERBOSE:
+            print(f"[ComfyGate] Unexpected websocket proxy error: {exc}")
         with contextlib.suppress(Exception):
-            await ws_server.close()
-        _active_ws -= 1
+            await ws_server.close(code=1011, message=b"internal error")
+        closed_by = "error"
+    finally:
+        _active_ws = max(_active_ws - 1, 0)
+        if not ws_server.closed:
+            with contextlib.suppress(Exception):
+                await ws_server.close()
+        if not timed_out:
+            print(f"[ComfyGate] WebSocket closed ({closed_by})")
         return ws_server
 
 
@@ -570,44 +659,44 @@ async def proxy_http(request: web.Request):
     if request.headers.get("Upgrade", "").lower() == "websocket":
         return await proxy_ws(request)
 
-    async with ClientSession() as session:
+    session = get_http_client()
 
-        if comfy_running() and await comfy_ready(session):  # try to get a response from ComfyUI
-            status = "ready"
-            pass  # Proxy normally if our instance is running
-        elif comfy_running():  # process exists and has not ended
-            status = "starting"
-            # Our instance is running but not yet ready → wait page
-            return web.Response(
-                text=get_status_page("starting"),
-                content_type="text/html",
-                headers={"Cache-Control": "no-store", "Connection": "close"},
-            )
-        elif _shutting_down:
-            status = "shutting_down"
-            return web.Response(
-                text=get_status_page("shutting_down"),
-                content_type="text/html",
-                headers={"Cache-Control": "no-store", "Connection": "close"},
-            )
-        elif is_blocked():
-            status = "blocked"  #  Blocked by other program (e.g., GPU in use) → refusal page
-            return web.Response(
-                text=get_status_page("blocked"),
-                content_type="text/html",
-                headers={"Cache-Control": "no-store", "Connection": "close"},
-            )
-        else:
-            status = "stopped"
-            # Not blocked → start ComfyUI and show wait page
-            await ensure_comfy_started()
-            return web.Response(
-                text=get_status_page("starting"),
-                content_type="text/html",
-                headers={"Cache-Control": "no-store", "Connection": "close"},
-            )
-        if VERBOSE and status != "ready":
-            print(f"[proxy_http] ComfyUI status: {status}")
+    if comfy_running() and await comfy_ready(session):  # try to get a response from ComfyUI
+        status = "ready"
+        pass  # Proxy normally if our instance is running
+    elif comfy_running():  # process exists and has not ended
+        status = "starting"
+        # Our instance is running but not yet ready → wait page
+        return web.Response(
+            text=get_status_page("starting"),
+            content_type="text/html",
+            headers={"Cache-Control": "no-store", "Connection": "close"},
+        )
+    elif _shutting_down:
+        status = "shutting_down"
+        return web.Response(
+            text=get_status_page("shutting_down"),
+            content_type="text/html",
+            headers={"Cache-Control": "no-store", "Connection": "close"},
+        )
+    elif is_blocked():
+        status = "blocked"  #  Blocked by other program (e.g., GPU in use) → refusal page
+        return web.Response(
+            text=get_status_page("blocked"),
+            content_type="text/html",
+            headers={"Cache-Control": "no-store", "Connection": "close"},
+        )
+    else:
+        status = "stopped"
+        # Not blocked → start ComfyUI and show wait page
+        await ensure_comfy_started()
+        return web.Response(
+            text=get_status_page("starting"),
+            content_type="text/html",
+            headers={"Cache-Control": "no-store", "Connection": "close"},
+        )
+    if VERBOSE and status != "ready":
+        print(f"[proxy_http] ComfyUI status: {status}")
 
     # If we reach here, it's ready and our instance → proxy the request
     if DECODE_PATHS and request.method == 'GET' and str(request.rel_url).startswith('/api/userdata'):
@@ -624,9 +713,8 @@ async def proxy_http(request: web.Request):
     headers["Host"] = f"{COMFY_HOST}:{COMFY_PORT}"
 
     data = await request.read()
-    timeout = ClientTimeout(total=None)
-    async with ClientSession(timeout=timeout) as session:
-        async with session.request(
+    session = get_http_client()
+    async with session.request(
             method=request.method,
             url=upstream_url,
             headers=headers,
@@ -691,6 +779,10 @@ async def main():
         await app.shutdown()  # Runs on_shutdown handlers
         await stop_comfy()
         await runner.cleanup()
+        global _http_client
+        if _http_client and not _http_client.closed:
+            await _http_client.close()
+        _http_client = None
 
 
 if __name__ == "__main__":
